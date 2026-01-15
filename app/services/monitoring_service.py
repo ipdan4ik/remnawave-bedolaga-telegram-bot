@@ -963,7 +963,9 @@ class MonitoringService:
             autopay_subscriptions = []
             for sub in all_autopay_subscriptions:
                 days_before_expiry = (sub.end_date - current_time).days
-                if days_before_expiry <= min(sub.autopay_days_before, 3):
+                # Используем значение из подписки или настройки по умолчанию
+                autopay_days = sub.autopay_days_before if sub.autopay_days_before else settings.DEFAULT_AUTOPAY_DAYS_BEFORE
+                if days_before_expiry <= autopay_days:
                     autopay_subscriptions.append(sub)
             
             processed_count = 0
@@ -973,20 +975,6 @@ class MonitoringService:
                 user = subscription.user
                 if not user:
                     continue
-                
-                # Правильный расчет стоимости продления с учетом всех параметров подписки
-                renewal_cost = await self.subscription_service.calculate_renewal_price(
-                    subscription, 30, db, user=user
-                )
-                promo_discount_percent = self._get_user_promo_offer_discount_percent(user)
-                charge_amount = renewal_cost
-                promo_discount_value = 0
-
-                if renewal_cost > 0 and promo_discount_percent > 0:
-                    charge_amount, promo_discount_value = apply_percentage_discount(
-                        renewal_cost,
-                        promo_discount_percent,
-                    )
 
                 autopay_key = f"autopay_{user.telegram_id}_{subscription.id}"
                 if autopay_key in self._notified_users:
@@ -1001,6 +989,20 @@ class MonitoringService:
                         available_periods = [int(p) for p in tariff.period_prices.keys()]
                         if available_periods:
                             renewal_period_days = min(available_periods)
+
+                # Правильный расчет стоимости продления с учетом периода из тарифа
+                renewal_cost = await self.subscription_service.calculate_renewal_price(
+                    subscription, renewal_period_days, db, user=user
+                )
+                promo_discount_percent = self._get_user_promo_offer_discount_percent(user)
+                charge_amount = renewal_cost
+                promo_discount_value = 0
+
+                if renewal_cost > 0 and promo_discount_percent > 0:
+                    charge_amount, promo_discount_value = apply_percentage_discount(
+                        renewal_cost,
+                        promo_discount_percent,
+                    )
 
                 # Try to charge from balance first (if fallback enabled) or directly from card
                 charge_success = False

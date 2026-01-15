@@ -55,6 +55,17 @@ async def get_all_tariffs(
     return result.scalars().all()
 
 
+async def get_tariff_by_name(
+    db: AsyncSession,
+    name: str,
+) -> Optional[Tariff]:
+    """Получает тариф по имени."""
+    result = await db.execute(
+        select(Tariff).where(Tariff.name == name)
+    )
+    return result.scalar_one_or_none()
+
+
 async def get_tariff_by_id(
     db: AsyncSession,
     tariff_id: int,

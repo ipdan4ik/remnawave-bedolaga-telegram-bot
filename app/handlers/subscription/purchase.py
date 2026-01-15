@@ -709,6 +709,12 @@ def _get_trial_payment_keyboard(language: str, can_pay_from_balance: bool = Fals
             callback_data="trial_payment_wata"
         )])
 
+    if settings.is_cloudpayments_enabled():
+        keyboard.append([types.InlineKeyboardButton(
+            text="💳 CloudPayments",
+            callback_data="trial_payment_cloudpayments"
+        )])
+
     # Кнопка назад
     keyboard.append([types.InlineKeyboardButton(
         text=texts.BACK,
@@ -3934,6 +3940,46 @@ async def handle_trial_payment_method(
                     [InlineKeyboardButton(
                         text=texts.t("CHECK_PAYMENT", "🔄 Проверить оплату"),
                         callback_data=f"check_trial_wata_{pending_subscription.id}"
+                    )],
+                    [InlineKeyboardButton(text=texts.BACK, callback_data="trial_activate")],
+                ]),
+                parse_mode="HTML",
+            )
+
+        elif payment_method == "cloudpayments":
+            # Оплата через CloudPayments
+            payment_result = await payment_service.create_cloudpayments_payment(
+                db=db,
+                user_id=db_user.id,
+                amount_kopeks=trial_price_kopeks,
+                description=texts.t("PAID_TRIAL_PAYMENT_DESC", "Пробная подписка на {days} дней").format(
+                    days=settings.TRIAL_DURATION_DAYS
+                ),
+                telegram_id=db_user.telegram_id,
+                language=db_user.language,
+                metadata={
+                    "type": "trial",
+                    "subscription_id": pending_subscription.id,
+                    "user_id": db_user.id,
+                },
+            )
+
+            if not payment_result or not payment_result.get("payment_url"):
+                await callback.answer("❌ Не удалось создать платеж. Попробуйте позже.", show_alert=True)
+                return
+
+            await callback.message.edit_text(
+                texts.t(
+                    "PAID_TRIAL_CLOUDPAYMENTS",
+                    "💳 <b>Оплата через CloudPayments</b>\n\n"
+                    "Нажмите кнопку ниже для перехода к оплате банковской картой.\n\n"
+                    "💰 Сумма: {amount}"
+                ).format(amount=settings.format_price(trial_price_kopeks)),
+                reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                    [InlineKeyboardButton(text="💳 Оплатить", url=payment_result["payment_url"])],
+                    [InlineKeyboardButton(
+                        text=texts.t("CHECK_PAYMENT", "🔄 Проверить оплату"),
+                        callback_data=f"check_trial_cloudpayments_{pending_subscription.id}"
                     )],
                     [InlineKeyboardButton(text=texts.BACK, callback_data="trial_activate")],
                 ]),

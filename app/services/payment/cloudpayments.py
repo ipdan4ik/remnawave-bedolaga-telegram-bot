@@ -33,6 +33,7 @@ class CloudPaymentsPaymentMixin:
         telegram_id: int,
         language: Optional[str] = None,
         email: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
     ) -> Optional[Dict[str, Any]]:
         """
         Create a CloudPayments payment and return payment link info.
@@ -90,10 +91,15 @@ class CloudPaymentsPaymentMixin:
             logger.exception("Непредвиденная ошибка при создании CloudPayments платежа: %s", error)
             return None
 
-        metadata = {
+        # Merge provided metadata with default metadata
+        default_metadata = {
             "language": language or settings.DEFAULT_LANGUAGE,
             "telegram_id": telegram_id,
         }
+        if metadata:
+            metadata = {**default_metadata, **metadata}
+        else:
+            metadata = default_metadata
 
         # Create local payment record
         local_payment = await payment_module.create_cloudpayments_payment(
@@ -311,6 +317,54 @@ class CloudPaymentsPaymentMixin:
                 await auto_activate_subscription_after_topup(db, user, bot=getattr(self, "bot", None))
             except Exception as error:
                 logger.exception("Ошибка умной автоактивации после CloudPayments: %s", error)
+
+        # Проверяем, не является ли это оплатой триала
+        payment_metadata = payment.metadata_json or {}
+        if payment_metadata.get("type") == "trial":
+            subscription_id = payment_metadata.get("subscription_id")
+            if subscription_id:
+                try:
+                    from app.database.crud.subscription import activate_pending_trial_subscription
+                    from app.services.subscription_service import SubscriptionService
+
+                    subscription = await activate_pending_trial_subscription(
+                        db=db,
+                        subscription_id=int(subscription_id),
+                        user_id=user.id,
+                    )
+
+                    if subscription:
+                        logger.info(
+                            "Триальная подписка %s активирована для пользователя %s через CloudPayments",
+                            subscription_id,
+                            user.id,
+                        )
+
+                        # Создаем пользователя в RemnaWave
+                        subscription_service = SubscriptionService()
+                        try:
+                            await subscription_service.create_remnawave_user(db, subscription)
+                        except Exception as rw_error:
+                            logger.error("Ошибка создания RemnaWave для триала: %s", rw_error)
+
+                        # Отправляем уведомление пользователю
+                        if hasattr(self, "bot") and self.bot:
+                            try:
+                                from app.localization.texts import get_texts
+                                texts = get_texts(user.language)
+                                await self.bot.send_message(
+                                    chat_id=user.telegram_id,
+                                    text=texts.t(
+                                        "TRIAL_ACTIVATED_SUCCESS",
+                                        "✅ <b>Пробная подписка активирована!</b>\n\n"
+                                        "Ваша подписка успешно активирована и готова к использованию.",
+                                    ),
+                                    parse_mode="HTML",
+                                )
+                            except Exception as notify_error:
+                                logger.error("Ошибка отправки уведомления о триале: %s", notify_error)
+                except Exception as trial_error:
+                    logger.exception("Ошибка активации триальной подписки через CloudPayments: %s", trial_error)
 
         return True
 
