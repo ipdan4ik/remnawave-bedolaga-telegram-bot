@@ -5952,6 +5952,90 @@ async def add_subscription_daily_columns() -> bool:
         return False
 
 
+async def ensure_cloudpayments_transaction_id_bigint() -> bool:
+    """
+    Изменяет тип колонки transaction_id_cp в таблице cloudpayments_payments
+    с INTEGER на BIGINT для поддержки больших значений TransactionId от CloudPayments.
+    """
+    table_name = "cloudpayments_payments"
+    column_name = "transaction_id_cp"
+    
+    if not await check_table_exists(table_name):
+        logger.warning(f"⚠️ Таблица {table_name} не существует, пропускаем миграцию")
+        return False
+    
+    if not await check_column_exists(table_name, column_name):
+        logger.warning(f"⚠️ Колонка {column_name} не существует в таблице {table_name}")
+        return False
+    
+    try:
+        async with engine.begin() as conn:
+            db_type = await get_database_type()
+            
+            # Проверяем текущий тип колонки
+            if db_type == 'postgresql':
+                result = await conn.execute(
+                    text("""
+                        SELECT data_type 
+                        FROM information_schema.columns 
+                        WHERE table_schema = 'public' 
+                          AND table_name = :table_name 
+                          AND column_name = :column_name
+                    """),
+                    {"table_name": table_name, "column_name": column_name}
+                )
+                row = result.fetchone()
+                if row and row[0] == 'bigint':
+                    logger.info(f"✅ Колонка {column_name} уже имеет тип BIGINT")
+                    return True
+                
+                # Изменяем тип на BIGINT (используем USING для явного приведения типа)
+                await conn.execute(
+                    text(f'ALTER TABLE {table_name} ALTER COLUMN {column_name} TYPE BIGINT USING {column_name}::BIGINT')
+                )
+                logger.info(f"✅ Тип колонки {column_name} изменен на BIGINT")
+                
+            elif db_type == 'mysql':
+                result = await conn.execute(
+                    text("""
+                        SELECT DATA_TYPE 
+                        FROM information_schema.columns 
+                        WHERE table_schema = DATABASE() 
+                          AND table_name = :table_name 
+                          AND column_name = :column_name
+                    """),
+                    {"table_name": table_name, "column_name": column_name}
+                )
+                row = result.fetchone()
+                if row and row[0] in ('bigint', 'BIGINT'):
+                    logger.info(f"✅ Колонка {column_name} уже имеет тип BIGINT")
+                    return True
+                
+                # Изменяем тип на BIGINT
+                await conn.execute(
+                    text(f'ALTER TABLE {table_name} MODIFY COLUMN {column_name} BIGINT')
+                )
+                logger.info(f"✅ Тип колонки {column_name} изменен на BIGINT")
+                
+            elif db_type == 'sqlite':
+                # SQLite не поддерживает изменение типа колонки напрямую
+                # Нужно пересоздать таблицу, но это сложная операция
+                logger.warning(
+                    f"⚠️ SQLite не поддерживает изменение типа колонки напрямую. "
+                    f"Колонка {column_name} должна быть пересоздана вручную."
+                )
+                return False
+            else:
+                logger.error(f"Неподдерживаемый тип БД: {db_type}")
+                return False
+            
+            return True
+            
+    except Exception as e:
+        logger.error(f"❌ Ошибка изменения типа колонки {column_name}: {e}")
+        return False
+
+
 async def add_subscription_traffic_reset_at_column() -> bool:
     """Добавляет колонку traffic_reset_at в subscriptions для сброса докупленного трафика через 30 дней."""
     try:
@@ -6530,6 +6614,13 @@ async def run_universal_migration():
             logger.info("✅ Колонка traffic_reset_at в subscriptions готова")
         else:
             logger.warning("⚠️ Проблемы с колонкой traffic_reset_at в subscriptions")
+
+        logger.info("=== ИЗМЕНЕНИЕ ТИПА КОЛОНКИ CLOUDPAYMENTS TRANSACTION_ID_CP ===")
+        cloudpayments_bigint_ready = await ensure_cloudpayments_transaction_id_bigint()
+        if cloudpayments_bigint_ready:
+            logger.info("✅ Колонка transaction_id_cp в cloudpayments_payments имеет тип BIGINT")
+        else:
+            logger.warning("⚠️ Проблемы с изменением типа колонки transaction_id_cp")
 
         logger.info("=== ОБНОВЛЕНИЕ ВНЕШНИХ КЛЮЧЕЙ ===")
         fk_updated = await fix_foreign_keys_for_user_deletion()
