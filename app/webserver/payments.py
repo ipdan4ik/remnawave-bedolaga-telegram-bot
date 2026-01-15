@@ -682,7 +682,7 @@ def create_payment_router(bot: Bot, payment_service: PaymentService) -> APIRoute
             raw_body = await request.body()
 
             # Проверяем подпись
-            signature = request.headers.get("X-Content-HMAC") or request.headers.get("Content-HMAC") or ""
+            signature = request.headers.get("Content-HMAC") or request.headers.get("X-Content-HMAC") or ""
             if settings.CLOUDPAYMENTS_API_SECRET and not cloudpayments_service.verify_webhook_signature(
                 raw_body, signature, settings.CLOUDPAYMENTS_API_SECRET
             ):
@@ -699,7 +699,7 @@ def create_payment_router(bot: Bot, payment_service: PaymentService) -> APIRoute
             raw_body = await request.body()
 
             # Проверяем подпись
-            signature = request.headers.get("X-Content-HMAC") or request.headers.get("Content-HMAC") or ""
+            signature = request.headers.get("Content-HMAC") or request.headers.get("X-Content-HMAC") or ""
             if settings.CLOUDPAYMENTS_API_SECRET and not cloudpayments_service.verify_webhook_signature(
                 raw_body, signature, settings.CLOUDPAYMENTS_API_SECRET
             ):
@@ -730,7 +730,7 @@ def create_payment_router(bot: Bot, payment_service: PaymentService) -> APIRoute
             raw_body = await request.body()
 
             # Проверяем подпись
-            signature = request.headers.get("X-Content-HMAC") or request.headers.get("Content-HMAC") or ""
+            signature = request.headers.get("Content-HMAC") or request.headers.get("X-Content-HMAC") or ""
             if settings.CLOUDPAYMENTS_API_SECRET and not cloudpayments_service.verify_webhook_signature(
                 raw_body, signature, settings.CLOUDPAYMENTS_API_SECRET
             ):
@@ -761,7 +761,7 @@ def create_payment_router(bot: Bot, payment_service: PaymentService) -> APIRoute
             raw_body = await request.body()
 
             # Проверяем подпись
-            signature = request.headers.get("X-Content-HMAC") or request.headers.get("Content-HMAC") or ""
+            signature = request.headers.get("Content-HMAC") or request.headers.get("X-Content-HMAC") or ""
             if settings.CLOUDPAYMENTS_API_SECRET and not cloudpayments_service.verify_webhook_signature(
                 raw_body, signature, settings.CLOUDPAYMENTS_API_SECRET
             ):
