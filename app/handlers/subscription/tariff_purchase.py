@@ -3185,17 +3185,25 @@ async def check_tariff_cloudpayments_payment(
         # Ищем последний платеж с метаданными для этого тарифа
         from sqlalchemy import select as sql_select
         from app.database.models import CloudPaymentsPayment
+        from sqlalchemy import cast, String
         
+        # Получаем все платежи пользователя и фильтруем в Python
+        # (более надежно, чем JSON запросы, которые зависят от типа БД)
         result = await db.execute(
             sql_select(CloudPaymentsPayment)
-            .where(
-                CloudPaymentsPayment.user_id == db_user.id,
-                CloudPaymentsPayment.metadata_json["subscription_id"].astext == str(subscription_id),
-            )
+            .where(CloudPaymentsPayment.user_id == db_user.id)
             .order_by(CloudPaymentsPayment.created_at.desc())
-            .limit(1)
+            .limit(50)  # Берем последние 50 платежей для фильтрации
         )
-        payment = result.scalar_one_or_none()
+        payments = result.scalars().all()
+        
+        # Фильтруем платежи по subscription_id в метаданных
+        payment = None
+        for p in payments:
+            if p.metadata_json and isinstance(p.metadata_json, dict):
+                if p.metadata_json.get("subscription_id") == subscription_id:
+                    payment = p
+                    break
         
         if payment and payment.is_paid:
             await callback.answer("✅ Платеж успешно обработан! Подписка должна быть активирована.", show_alert=True)
