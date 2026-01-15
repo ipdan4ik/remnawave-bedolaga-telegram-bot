@@ -1089,6 +1089,93 @@ async def select_tariff_period(
     else:
         # Недостаточно средств
         missing = final_price - user_balance
+        
+        # Проверяем, включен ли автоплатеж у пользователя
+        subscription = await get_subscription_by_user_id(db, db_user.id)
+        autopay_enabled = False
+        if subscription:
+            autopay_enabled = subscription.autopay_enabled
+        
+        # Если автоплатеж включен и CloudPayments доступен, создаем инвойс сразу
+        if autopay_enabled and settings.is_cloudpayments_enabled():
+            try:
+                from app.services.payment_service import PaymentService
+                from app.database.crud.subscription import create_pending_subscription
+                
+                # Получаем список серверов из тарифа
+                squads = tariff.allowed_squads or []
+                if not squads:
+                    from app.database.crud.server_squad import get_all_server_squads
+                    all_servers, _ = await get_all_server_squads(db, available_only=True)
+                    squads = [s.squad_uuid for s in all_servers if s.squad_uuid]
+                
+                # Создаем pending подписку
+                pending_subscription = await create_pending_subscription(
+                    db=db,
+                    user_id=db_user.id,
+                    duration_days=period,
+                    traffic_limit_gb=tariff.traffic_limit_gb,
+                    device_limit=tariff.device_limit,
+                    connected_squads=squads,
+                    payment_method="cloudpayments",
+                    total_price_kopeks=final_price,
+                    is_trial=False,
+                )
+                
+                # Обновляем tariff_id для pending подписки
+                pending_subscription.tariff_id = tariff.id
+                await db.commit()
+                await db.refresh(pending_subscription)
+                
+                # Создаем платеж через CloudPayments
+                payment_service = PaymentService(callback.bot)
+                texts = get_texts(db_user.language)
+                
+                payment_result = await payment_service.create_cloudpayments_payment(
+                    db=db,
+                    user_id=db_user.id,
+                    amount_kopeks=final_price,
+                    description=texts.t("TARIFF_PURCHASE_DESC", "Покупка тарифа '{name}' на {days} дней").format(
+                        name=tariff.name,
+                        days=period
+                    ),
+                    telegram_id=db_user.telegram_id,
+                    language=db_user.language,
+                    metadata={
+                        "type": "tariff_purchase",
+                        "subscription_id": pending_subscription.id,
+                        "tariff_id": tariff_id,
+                        "period_days": period,
+                        "user_id": db_user.id,
+                    },
+                )
+                
+                if payment_result and payment_result.get("payment_url"):
+                    await callback.message.edit_text(
+                        f"💳 <b>Оплата тарифа</b>\n\n"
+                        f"📦 Тариф: <b>{tariff.name}</b>\n"
+                        f"📅 Период: {_format_period(period)}\n"
+                        f"💰 Сумма: {_format_price_kopeks(final_price)}\n\n"
+                        f"Нажмите кнопку ниже для перехода к оплате банковской картой.",
+                        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                            [InlineKeyboardButton(text="💳 Оплатить", url=payment_result["payment_url"])],
+                            [InlineKeyboardButton(
+                                text=texts.t("CHECK_PAYMENT", "🔄 Проверить оплату"),
+                                callback_data=f"check_tariff_cloudpayments_{pending_subscription.id}"
+                            )],
+                            [InlineKeyboardButton(text=texts.BACK, callback_data=f"tariff_select:{tariff_id}")],
+                        ]),
+                        parse_mode="HTML"
+                    )
+                    await callback.answer()
+                    return
+                else:
+                    logger.error("Не удалось создать платеж CloudPayments для тарифа")
+            except Exception as e:
+                logger.exception(f"Ошибка создания платежа CloudPayments для тарифа: {e}")
+                # Продолжаем с обычной логикой пополнения баланса
+        
+        # Обычная логика: предлагаем пополнить баланс
         await callback.message.edit_text(
             f"❌ <b>Недостаточно средств</b>\n\n"
             f"📦 Тариф: <b>{tariff.name}</b>\n"
@@ -3052,6 +3139,79 @@ async def confirm_instant_switch(
         await callback.answer("Произошла ошибка при переключении тарифа", show_alert=True)
 
 
+@error_handler
+async def check_tariff_cloudpayments_payment(
+    callback: types.CallbackQuery,
+    db_user: User,
+    db: AsyncSession,
+):
+    """Проверяет статус оплаты тарифа через CloudPayments."""
+    try:
+        subscription_id = int(callback.data.split("_")[-1])
+        
+        from app.database.crud.subscription import get_subscription_by_user_id
+        from sqlalchemy import select
+        from app.database.models import Subscription, SubscriptionStatus
+        
+        # Получаем подписку
+        result = await db.execute(
+            select(Subscription).where(
+                Subscription.id == subscription_id,
+                Subscription.user_id == db_user.id,
+            )
+        )
+        subscription = result.scalar_one_or_none()
+        
+        if not subscription:
+            await callback.answer("❌ Подписка не найдена", show_alert=True)
+            return
+        
+        texts = get_texts(db_user.language)
+        
+        # Проверяем статус подписки
+        if subscription.status == SubscriptionStatus.ACTIVE.value:
+            await callback.answer("✅ Подписка уже активирована!", show_alert=True)
+            return
+        elif subscription.status != SubscriptionStatus.PENDING.value:
+            await callback.answer("⚠️ Подписка не ожидает оплаты", show_alert=True)
+            return
+        
+        # Проверяем платежи CloudPayments для этого пользователя
+        from app.database.crud.cloudpayments import get_cloudpayments_payment_by_invoice_id
+        from app.services.payment_service import PaymentService
+        
+        payment_service = PaymentService(callback.bot)
+        
+        # Ищем последний платеж с метаданными для этого тарифа
+        from sqlalchemy import select as sql_select
+        from app.database.models import CloudPaymentsPayment
+        
+        result = await db.execute(
+            sql_select(CloudPaymentsPayment)
+            .where(
+                CloudPaymentsPayment.user_id == db_user.id,
+                CloudPaymentsPayment.metadata_json["subscription_id"].astext == str(subscription_id),
+            )
+            .order_by(CloudPaymentsPayment.created_at.desc())
+            .limit(1)
+        )
+        payment = result.scalar_one_or_none()
+        
+        if payment and payment.is_paid:
+            await callback.answer("✅ Платеж успешно обработан! Подписка должна быть активирована.", show_alert=True)
+            return
+        elif payment:
+            await callback.answer("⏳ Платеж еще обрабатывается. Попробуйте позже.", show_alert=True)
+            return
+        else:
+            await callback.answer("⚠️ Платеж не найден. Попробуйте оплатить снова.", show_alert=True)
+            return
+            
+    except Exception as e:
+        logger.exception(f"Ошибка проверки оплаты тарифа: {e}")
+        await callback.answer("❌ Произошла ошибка при проверке оплаты", show_alert=True)
+
+
 def register_tariff_purchase_handlers(dp: Dispatcher):
     """Регистрирует обработчики покупки по тарифам."""
     # Список тарифов (для режима tariffs)
@@ -3093,3 +3253,6 @@ def register_tariff_purchase_handlers(dp: Dispatcher):
     dp.callback_query.register(show_instant_switch_list, F.data == "instant_switch")
     dp.callback_query.register(preview_instant_switch, F.data.startswith("instant_sw_preview:"))
     dp.callback_query.register(confirm_instant_switch, F.data.startswith("instant_sw_confirm:"))
+    
+    # Проверка оплаты тарифа через CloudPayments
+    dp.callback_query.register(check_tariff_cloudpayments_payment, F.data.startswith("check_tariff_cloudpayments_"))

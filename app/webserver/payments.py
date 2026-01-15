@@ -754,6 +754,37 @@ def create_payment_router(bot: Bot, payment_service: PaymentService) -> APIRoute
 
             return JSONResponse({"code": 0})
 
+        # CloudPayments Recurrent webhook (рекуррентные платежи)
+        @router.post(settings.CLOUDPAYMENTS_WEBHOOK_PATH + "/recurrent")
+        async def cloudpayments_recurrent_webhook(request: Request) -> JSONResponse:
+            """Recurrent webhook - вызывается для рекуррентных платежей."""
+            raw_body = await request.body()
+
+            # Проверяем подпись
+            signature = request.headers.get("X-Content-HMAC") or request.headers.get("Content-HMAC") or ""
+            if settings.CLOUDPAYMENTS_API_SECRET and not cloudpayments_service.verify_webhook_signature(
+                raw_body, signature, settings.CLOUDPAYMENTS_API_SECRET
+            ):
+                logger.warning("CloudPayments recurrent webhook: invalid signature")
+                return JSONResponse({"code": 13})
+
+            # Парсим данные формы
+            try:
+                form_data = await request.form()
+                webhook_data = cloudpayments_service.parse_webhook_data(dict(form_data))
+            except Exception as error:
+                logger.error("CloudPayments recurrent webhook parse error: %s", error)
+                return JSONResponse({"code": 0})
+
+            # Обрабатываем рекуррентный платёж
+            success = await _process_payment_service_callback(
+                payment_service,
+                webhook_data,
+                "process_cloudpayments_recurrent_webhook",
+            )
+
+            return JSONResponse({"code": 0})
+
         # Универсальный endpoint для всех webhooks
         @router.post(settings.CLOUDPAYMENTS_WEBHOOK_PATH)
         async def cloudpayments_webhook(request: Request) -> JSONResponse:

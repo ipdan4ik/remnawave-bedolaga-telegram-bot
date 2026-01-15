@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import json
-from datetime import datetime
+from datetime import datetime, timedelta
 from importlib import import_module
 from typing import Any, Dict, Optional
 
@@ -365,6 +365,204 @@ class CloudPaymentsPaymentMixin:
                                 logger.error("Ошибка отправки уведомления о триале: %s", notify_error)
                 except Exception as trial_error:
                     logger.exception("Ошибка активации триальной подписки через CloudPayments: %s", trial_error)
+        
+        # Проверяем, не является ли это оплатой тарифа
+        if payment_metadata.get("type") == "tariff_purchase":
+            subscription_id = payment_metadata.get("subscription_id")
+            tariff_id = payment_metadata.get("tariff_id")
+            period_days = payment_metadata.get("period_days")
+            
+            if subscription_id:
+                try:
+                    from app.database.crud.subscription import get_subscription_by_user_id, extend_subscription
+                    from app.services.subscription_service import SubscriptionService
+                    from sqlalchemy import select, and_
+                    from app.database.models import Subscription, SubscriptionStatus
+                    
+                    # Получаем pending подписку по ID
+                    result = await db.execute(
+                        select(Subscription).where(
+                            Subscription.id == int(subscription_id),
+                            Subscription.user_id == user.id,
+                            Subscription.status == SubscriptionStatus.PENDING.value,
+                        )
+                    )
+                    pending_subscription = result.scalar_one_or_none()
+                    
+                    if pending_subscription and pending_subscription.status == SubscriptionStatus.PENDING.value:
+                        # Проверяем, есть ли уже активная подписка
+                        existing_subscription = await get_subscription_by_user_id(db, user.id)
+                        
+                        if existing_subscription and existing_subscription.status == SubscriptionStatus.ACTIVE.value:
+                            # Продлеваем существующую подписку
+                            subscription = await extend_subscription(
+                                db,
+                                existing_subscription,
+                                days=period_days or 30,
+                                tariff_id=tariff_id,
+                                traffic_limit_gb=pending_subscription.traffic_limit_gb,
+                                device_limit=pending_subscription.device_limit,
+                                connected_squads=pending_subscription.connected_squads,
+                            )
+                            # Удаляем pending подписку
+                            await db.delete(pending_subscription)
+                            await db.commit()
+                        else:
+                            # Активируем pending подписку
+                            current_time = datetime.utcnow()
+                            pending_subscription.status = SubscriptionStatus.ACTIVE.value
+                            pending_subscription.is_trial = False
+                            if not pending_subscription.start_date or pending_subscription.start_date < current_time:
+                                pending_subscription.start_date = current_time
+                            # Пересчитываем end_date если нужно
+                            if pending_subscription.end_date and pending_subscription.end_date < current_time:
+                                pending_subscription.end_date = current_time + timedelta(days=period_days or 30)
+                            subscription = pending_subscription
+                            await db.commit()
+                        
+                        await db.refresh(subscription)
+                        
+                        logger.info(
+                            "Подписка тарифа %s активирована для пользователя %s через CloudPayments",
+                            subscription_id,
+                            user.id,
+                        )
+                        
+                        # Создаем пользователя в RemnaWave
+                        subscription_service = SubscriptionService()
+                        try:
+                            await subscription_service.create_remnawave_user(
+                                db,
+                                subscription,
+                                reset_traffic=settings.RESET_TRAFFIC_ON_PAYMENT,
+                                reset_reason="покупка тарифа",
+                            )
+                        except Exception as rw_error:
+                            logger.error("Ошибка создания RemnaWave для тарифа: %s", rw_error)
+                        
+                        # Отправляем уведомление пользователю
+                        if hasattr(self, "bot") and self.bot:
+                            try:
+                                from app.localization.texts import get_texts
+                                from app.database.crud.tariff import get_tariff_by_id
+                                
+                                texts = get_texts(user.language)
+                                tariff_name = "тарифа"
+                                if tariff_id:
+                                    tariff = await get_tariff_by_id(db, tariff_id)
+                                    if tariff:
+                                        tariff_name = tariff.name
+                                
+                                await self.bot.send_message(
+                                    chat_id=user.telegram_id,
+                                    text=texts.t(
+                                        "TARIFF_PURCHASE_SUCCESS",
+                                        "✅ <b>Тариф успешно активирован!</b>\n\n"
+                                        "Ваша подписка успешно активирована и готова к использованию.",
+                                    ),
+                                    parse_mode="HTML",
+                                )
+                            except Exception as notify_error:
+                                logger.error("Ошибка отправки уведомления о тарифе: %s", notify_error)
+                except Exception as tariff_error:
+                    logger.exception("Ошибка активации подписки тарифа через CloudPayments: %s", tariff_error)
+
+        return True
+
+    async def process_cloudpayments_recurrent_webhook(
+        self,
+        db: AsyncSession,
+        webhook_data: Dict[str, Any],
+    ) -> bool:
+        """
+        Process CloudPayments Recurrent webhook (recurrent payment notification).
+
+        Args:
+            db: Database session
+            webhook_data: Parsed webhook data
+
+        Returns:
+            True if payment was processed successfully
+        """
+        invoice_id = webhook_data.get("invoice_id")
+        transaction_id_cp = webhook_data.get("transaction_id")
+        amount = webhook_data.get("amount", 0)
+        amount_kopeks = int(amount * 100)
+        account_id = webhook_data.get("account_id", "")
+        token = webhook_data.get("token")
+        test_mode = webhook_data.get("test_mode", False)
+
+        if not invoice_id:
+            logger.error("CloudPayments recurrent webhook без invoice_id")
+            return False
+
+        payment_module = import_module("app.services.payment_service")
+
+        # Find existing payment record (should already exist from API call)
+        payment = await payment_module.get_cloudpayments_payment_by_invoice_id(db, invoice_id)
+
+        if not payment:
+            logger.warning(
+                "CloudPayments рекуррентный платёж не найден: invoice=%s",
+                invoice_id,
+            )
+            # Try to extract telegram_id from account_id
+            try:
+                telegram_id = int(account_id) if account_id else None
+            except ValueError:
+                telegram_id = None
+
+            if not telegram_id:
+                logger.error("Не удалось определить telegram_id из account_id: %s", account_id)
+                return False
+
+            # Get user by telegram_id
+            from app.database.crud.user import get_user_by_telegram_id
+            user = await get_user_by_telegram_id(db, telegram_id)
+            if not user:
+                logger.error("Пользователь не найден: telegram_id=%s", telegram_id)
+                return False
+
+            # Create payment record (fallback, should not happen normally)
+            payment = await payment_module.create_cloudpayments_payment(
+                db=db,
+                user_id=user.id,
+                invoice_id=invoice_id,
+                amount_kopeks=amount_kopeks,
+                description="Автопродление подписки",
+                test_mode=test_mode,
+            )
+
+            if not payment:
+                logger.error("Не удалось создать запись рекуррентного платежа")
+                return False
+
+        # Check if already processed
+        if payment.is_paid:
+            logger.info("CloudPayments рекуррентный платёж уже обработан: invoice=%s", invoice_id)
+            return True
+
+        # Update payment record with webhook data
+        payment.transaction_id_cp = transaction_id_cp
+        payment.status = "completed"
+        payment.is_paid = True
+        payment.paid_at = datetime.utcnow()
+        if token:
+            payment.token = token
+        payment.card_first_six = webhook_data.get("card_first_six")
+        payment.card_last_four = webhook_data.get("card_last_four")
+        payment.card_type = webhook_data.get("card_type")
+        payment.card_exp_date = webhook_data.get("card_exp_date")
+        payment.test_mode = test_mode
+        payment.callback_payload = webhook_data
+
+        await db.commit()
+
+        logger.info(
+            "CloudPayments рекуррентный платёж подтверждён через webhook: invoice=%s, amount=%s₽",
+            invoice_id,
+            amount_kopeks / 100,
+        )
 
         return True
 
