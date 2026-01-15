@@ -553,6 +553,41 @@ class CloudPaymentsPayment(Base):
     user = relationship("User", backref="cloudpayments_payments")
     transaction = relationship("Transaction", backref="cloudpayments_payment")
 
+
+class CloudPaymentsSavedCard(Base):
+    """Сохраненные карты пользователей для рекуррентных платежей CloudPayments."""
+    __tablename__ = "cloudpayments_saved_cards"
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
+
+    # Токен карты от CloudPayments
+    token = Column(String(255), nullable=False)
+
+    # Данные карты (маскированные)
+    card_first_six = Column(String(6), nullable=True)
+    card_last_four = Column(String(4), nullable=True)
+    card_type = Column(String(50), nullable=True)  # Visa, MasterCard, etc.
+    card_exp_date = Column(String(10), nullable=True)  # MM/YY
+
+    # Флаг карты по умолчанию
+    is_default = Column(Boolean, default=False, nullable=False)
+
+    # Временные метки
+    created_at = Column(DateTime, default=func.now())
+    updated_at = Column(DateTime, default=func.now(), onupdate=func.now())
+    last_used_at = Column(DateTime, nullable=True)
+
+    user = relationship("User", backref="cloudpayments_saved_cards")
+
+    __table_args__ = (
+        UniqueConstraint("user_id", "token", name="uq_user_token"),
+        Index("ix_cloudpayments_saved_cards_user_default", "user_id", "is_default"),
+    )
+
+    def __repr__(self) -> str:
+        return f"<CloudPaymentsSavedCard(id={self.id}, user_id={self.user_id}, card_last_four={self.card_last_four}, is_default={self.is_default})>"
+
     @property
     def amount_rubles(self) -> float:
         return self.amount_kopeks / 100

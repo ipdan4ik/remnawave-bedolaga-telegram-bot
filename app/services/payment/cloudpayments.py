@@ -247,6 +247,47 @@ class CloudPaymentsPaymentMixin:
             user.telegram_id,
         )
 
+        # Save card token for recurrent payments if enabled
+        if settings.ENABLE_CLOUDPAYMENTS_RECURRENT and token:
+            try:
+                from app.database.crud.cloudpayments_saved_cards import (
+                    create_saved_card,
+                    get_card_by_token,
+                )
+
+                # Check if card with this token already exists
+                existing_card = await get_card_by_token(db, user.id, token)
+                if not existing_card:
+                    # Create new saved card
+                    await create_saved_card(
+                        db=db,
+                        user_id=user.id,
+                        token=token,
+                        card_first_six=webhook_data.get("card_first_six"),
+                        card_last_four=webhook_data.get("card_last_four"),
+                        card_type=webhook_data.get("card_type"),
+                        card_exp_date=webhook_data.get("card_exp_date"),
+                        is_default=False,  # Will be set to True if user has no cards
+                    )
+                    await db.commit()
+                    logger.info(
+                        "Сохранена карта CloudPayments для пользователя %s (token=%s...)",
+                        user.telegram_id,
+                        token[:10],
+                    )
+                else:
+                    logger.debug(
+                        "Карта с токеном уже существует для пользователя %s",
+                        user.telegram_id,
+                    )
+            except Exception as error:
+                logger.exception(
+                    "Ошибка сохранения карты CloudPayments для пользователя %s: %s",
+                    user.telegram_id,
+                    error,
+                )
+                # Не прерываем обработку платежа из-за ошибки сохранения карты
+
         # Send notification to user
         try:
             await self._send_cloudpayments_success_notification(
@@ -395,6 +436,90 @@ class CloudPaymentsPaymentMixin:
             )
         except Exception as error:
             logger.warning("Не удалось отправить уведомление пользователю %s: %s", telegram_id, error)
+
+    async def _send_recurrent_payment_success_notification(
+        self,
+        user: Any,
+        amount_kopeks: int,
+        period_days: int,
+    ) -> None:
+        """Send success notification for recurrent payment via Telegram."""
+        bot = getattr(self, "bot", None)
+        from app.localization.texts import get_texts
+
+        if not bot:
+            return
+
+        texts = get_texts(user.language)
+        amount_rub = amount_kopeks / 100
+
+        # Get saved card info
+        from app.database.crud.cloudpayments_saved_cards import get_default_card
+        from app.database.database import AsyncSessionLocal
+
+        async with AsyncSessionLocal() as db:
+            saved_card = await get_default_card(db, user.id)
+            card_info = ""
+            if saved_card and saved_card.card_last_four:
+                card_info = f"💳 Карта: ****{saved_card.card_last_four}\n"
+
+        message = (
+            f"✅ <b>Автопродление подписки</b>\n\n"
+            f"💰 Сумма: {amount_rub:.2f}₽\n"
+            f"{card_info}"
+            f"📅 Период: {period_days} дней\n\n"
+            f"Средства успешно списаны с вашей карты."
+        )
+
+        try:
+            await bot.send_message(
+                chat_id=user.telegram_id,
+                text=message,
+                parse_mode="HTML",
+            )
+        except Exception as error:
+            logger.warning("Не удалось отправить уведомление о рекуррентном платеже пользователю %s: %s", user.telegram_id, error)
+
+    async def _send_recurrent_payment_failed_notification(
+        self,
+        user: Any,
+        amount_kopeks: int,
+        error_message: str,
+    ) -> None:
+        """Send failure notification for recurrent payment via Telegram."""
+        bot = getattr(self, "bot", None)
+
+        if not bot:
+            return
+
+        amount_rub = amount_kopeks / 100
+
+        # Get saved card info
+        from app.database.crud.cloudpayments_saved_cards import get_default_card
+        from app.database.database import AsyncSessionLocal
+
+        card_info = ""
+        async with AsyncSessionLocal() as db:
+            saved_card = await get_default_card(db, user.id)
+            if saved_card and saved_card.card_last_four:
+                card_info = f"💳 Карта: ****{saved_card.card_last_four}\n"
+
+        message = (
+            f"❌ <b>Ошибка автопродления подписки</b>\n\n"
+            f"💰 Требуемая сумма: {amount_rub:.2f}₽\n"
+            f"{card_info}"
+            f"⚠️ {error_message}\n\n"
+            f"Пожалуйста, пополните баланс или проверьте карту."
+        )
+
+        try:
+            await bot.send_message(
+                chat_id=user.telegram_id,
+                text=message,
+                parse_mode="HTML",
+            )
+        except Exception as error:
+            logger.warning("Не удалось отправить уведомление об ошибке рекуррентного платежа пользователю %s: %s", user.telegram_id, error)
 
     async def get_cloudpayments_payment_status(
         self,

@@ -992,45 +992,157 @@ class MonitoringService:
                 if autopay_key in self._notified_users:
                     continue
 
-                if user.balance_kopeks >= charge_amount:
-                    success = await subtract_user_balance(
-                        db, user, charge_amount,
-                        "Автопродление подписки"
+                # Determine period for renewal (30 days default, or from tariff)
+                renewal_period_days = 30
+                if subscription.tariff_id:
+                    from app.database.crud.tariff import get_tariff_by_id
+                    tariff = await get_tariff_by_id(db, subscription.tariff_id)
+                    if tariff and tariff.period_prices:
+                        available_periods = [int(p) for p in tariff.period_prices.keys()]
+                        if available_periods:
+                            renewal_period_days = min(available_periods)
+
+                # Try to charge from balance first (if fallback enabled) or directly from card
+                charge_success = False
+                charge_method = None
+
+                if settings.CLOUDPAYMENTS_RECURRENT_FALLBACK_ENABLED:
+                    # Fallback mode: try balance first, then card
+                    if user.balance_kopeks >= charge_amount:
+                        success = await subtract_user_balance(
+                            db, user, charge_amount,
+                            "Автопродление подписки"
+                        )
+                        if success:
+                            charge_success = True
+                            charge_method = "balance"
+                    else:
+                        # Balance insufficient, try CloudPayments card if enabled
+                        if settings.ENABLE_CLOUDPAYMENTS_RECURRENT:
+                            from app.database.crud.cloudpayments_saved_cards import get_default_card
+                            from app.services.cloudpayments_recurrent_service import CloudPaymentsRecurrentService
+
+                            saved_card = await get_default_card(db, user.id)
+                            if saved_card:
+                                recurrent_service = CloudPaymentsRecurrentService()
+                                success, error_message = await recurrent_service.charge_subscription_renewal(
+                                    db=db,
+                                    user=user,
+                                    subscription=subscription,
+                                    amount_kopeks=charge_amount,
+                                    period_days=renewal_period_days,
+                                    saved_card=saved_card,
+                                )
+                                if success:
+                                    charge_success = True
+                                    charge_method = "cloudpayments"
+                                else:
+                                    logger.warning(
+                                        "Ошибка рекуррентного списания CloudPayments для пользователя %s: %s",
+                                        user.telegram_id,
+                                        error_message,
+                                    )
+                else:
+                    # Card-only mode: use CloudPayments card directly
+                    if settings.ENABLE_CLOUDPAYMENTS_RECURRENT:
+                        from app.database.crud.cloudpayments_saved_cards import get_default_card
+                        from app.services.cloudpayments_recurrent_service import CloudPaymentsRecurrentService
+
+                        saved_card = await get_default_card(db, user.id)
+                        if saved_card:
+                            recurrent_service = CloudPaymentsRecurrentService()
+                            success, error_message = await recurrent_service.charge_subscription_renewal(
+                                db=db,
+                                user=user,
+                                subscription=subscription,
+                                amount_kopeks=charge_amount,
+                                period_days=renewal_period_days,
+                                saved_card=saved_card,
+                            )
+                            if success:
+                                charge_success = True
+                                charge_method = "cloudpayments"
+                            else:
+                                logger.warning(
+                                    "Ошибка рекуррентного списания CloudPayments для пользователя %s: %s",
+                                    user.telegram_id,
+                                    error_message,
+                                )
+                        else:
+                            logger.warning(
+                                "Нет сохраненной карты для рекуррентного списания у пользователя %s",
+                                user.telegram_id,
+                            )
+                    else:
+                        # Recurrent disabled, try balance
+                        if user.balance_kopeks >= charge_amount:
+                            success = await subtract_user_balance(
+                                db, user, charge_amount,
+                                "Автопродление подписки"
+                            )
+                            if success:
+                                charge_success = True
+                                charge_method = "balance"
+
+                if charge_success:
+                    # Extend subscription
+                    await extend_subscription(db, subscription, renewal_period_days)
+                    await self.subscription_service.update_remnawave_user(
+                        db,
+                        subscription,
+                        reset_traffic=settings.RESET_TRAFFIC_ON_PAYMENT,
+                        reset_reason="автопродление подписки",
                     )
 
-                    if success:
-                        await extend_subscription(db, subscription, 30)
-                        await self.subscription_service.update_remnawave_user(
-                            db,
-                            subscription,
-                            reset_traffic=settings.RESET_TRAFFIC_ON_PAYMENT,
-                            reset_reason="автопродление подписки",
-                        )
+                    if promo_discount_value > 0:
+                        await self._consume_user_promo_offer_discount(db, user)
 
-                        if promo_discount_value > 0:
-                            await self._consume_user_promo_offer_discount(db, user)
+                    if self.bot:
+                        if charge_method == "cloudpayments":
+                            # Send CloudPayments-specific notification
+                            from app.services.payment.cloudpayments import CloudPaymentsPaymentMixin
+                            # Create mixin instance with bot
+                            mixin = CloudPaymentsPaymentMixin()
+                            mixin.bot = self.bot
+                            await mixin._send_recurrent_payment_success_notification(
+                                user=user,
+                                amount_kopeks=charge_amount,
+                                period_days=renewal_period_days,
+                            )
+                        else:
+                            await self._send_autopay_success_notification(user, charge_amount, renewal_period_days)
 
-                        if self.bot:
-                            await self._send_autopay_success_notification(user, charge_amount, 30)
-
-                        processed_count += 1
-                        self._notified_users.add(autopay_key)
-                        logger.info(
-                            "💳 Автопродление подписки пользователя %s успешно (списано %s, скидка %s%%)",
-                            user.telegram_id,
-                            charge_amount,
-                            promo_discount_percent,
-                        )
-                    else:
-                        failed_count += 1
-                        if self.bot:
-                            await self._send_autopay_failed_notification(user, user.balance_kopeks, charge_amount)
-                        logger.warning(f"💳 Ошибка списания средств для автопродления пользователя {user.telegram_id}")
+                    processed_count += 1
+                    self._notified_users.add(autopay_key)
+                    logger.info(
+                        "💳 Автопродление подписки пользователя %s успешно (списано %s, метод=%s, скидка %s%%)",
+                        user.telegram_id,
+                        charge_amount,
+                        charge_method,
+                        promo_discount_percent,
+                    )
                 else:
                     failed_count += 1
                     if self.bot:
-                        await self._send_autopay_failed_notification(user, user.balance_kopeks, charge_amount)
-                    logger.warning(f"💳 Недостаточно средств для автопродления у пользователя {user.telegram_id}")
+                        # Check if we tried CloudPayments and failed
+                        if settings.ENABLE_CLOUDPAYMENTS_RECURRENT:
+                            from app.database.crud.cloudpayments_saved_cards import get_default_card
+                            saved_card = await get_default_card(db, user.id)
+                            if saved_card and (not settings.CLOUDPAYMENTS_RECURRENT_FALLBACK_ENABLED or user.balance_kopeks < charge_amount):
+                                # Send CloudPayments-specific failure notification
+                                from app.services.payment.cloudpayments import CloudPaymentsPaymentMixin
+                                mixin = CloudPaymentsPaymentMixin()
+                                mixin.bot = self.bot
+                                await mixin._send_recurrent_payment_failed_notification(
+                                    user=user,
+                                    amount_kopeks=charge_amount,
+                                    error_message="Не удалось списать средства с карты",
+                                )
+                            else:
+                                await self._send_autopay_failed_notification(user, user.balance_kopeks, charge_amount)
+                        else:
+                            await self._send_autopay_failed_notification(user, user.balance_kopeks, charge_amount)
+                    logger.warning(f"💳 Не удалось списать средства для автопродления у пользователя {user.telegram_id}")
             
             if processed_count > 0 or failed_count > 0:
                 await self._log_monitoring_event(

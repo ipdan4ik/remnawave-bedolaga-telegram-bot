@@ -5952,6 +5952,95 @@ async def add_subscription_daily_columns() -> bool:
         return False
 
 
+async def create_cloudpayments_saved_cards_table():
+    """Создает таблицу для сохраненных карт CloudPayments."""
+    table_name = "cloudpayments_saved_cards"
+    
+    if await check_table_exists(table_name):
+        logger.info(f"Таблица {table_name} уже существует")
+        return True
+    
+    try:
+        async with engine.begin() as conn:
+            db_type = await get_database_type()
+            
+            if db_type == 'sqlite':
+                create_sql = """
+                CREATE TABLE cloudpayments_saved_cards (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    user_id INTEGER NOT NULL,
+                    token VARCHAR(255) NOT NULL,
+                    card_first_six VARCHAR(6) NULL,
+                    card_last_four VARCHAR(4) NULL,
+                    card_type VARCHAR(50) NULL,
+                    card_exp_date VARCHAR(10) NULL,
+                    is_default BOOLEAN NOT NULL DEFAULT 0,
+                    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                    last_used_at DATETIME NULL,
+                    FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
+                    UNIQUE(user_id, token)
+                );
+                
+                CREATE INDEX idx_cloudpayments_saved_cards_user_id ON cloudpayments_saved_cards(user_id);
+                CREATE INDEX idx_cloudpayments_saved_cards_user_default ON cloudpayments_saved_cards(user_id, is_default);
+                """
+                
+            elif db_type == 'postgresql':
+                create_sql = """
+                CREATE TABLE cloudpayments_saved_cards (
+                    id SERIAL PRIMARY KEY,
+                    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                    token VARCHAR(255) NOT NULL,
+                    card_first_six VARCHAR(6) NULL,
+                    card_last_four VARCHAR(4) NULL,
+                    card_type VARCHAR(50) NULL,
+                    card_exp_date VARCHAR(10) NULL,
+                    is_default BOOLEAN NOT NULL DEFAULT FALSE,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    last_used_at TIMESTAMP NULL,
+                    CONSTRAINT uq_user_token UNIQUE(user_id, token)
+                );
+                
+                CREATE INDEX idx_cloudpayments_saved_cards_user_id ON cloudpayments_saved_cards(user_id);
+                CREATE INDEX idx_cloudpayments_saved_cards_user_default ON cloudpayments_saved_cards(user_id, is_default);
+                """
+                
+            elif db_type == 'mysql':
+                create_sql = """
+                CREATE TABLE cloudpayments_saved_cards (
+                    id INT AUTO_INCREMENT PRIMARY KEY,
+                    user_id INT NOT NULL,
+                    token VARCHAR(255) NOT NULL,
+                    card_first_six VARCHAR(6) NULL,
+                    card_last_four VARCHAR(4) NULL,
+                    card_type VARCHAR(50) NULL,
+                    card_exp_date VARCHAR(10) NULL,
+                    is_default BOOLEAN NOT NULL DEFAULT FALSE,
+                    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+                    last_used_at DATETIME NULL,
+                    FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
+                    UNIQUE KEY uq_user_token (user_id, token)
+                );
+                
+                CREATE INDEX idx_cloudpayments_saved_cards_user_id ON cloudpayments_saved_cards(user_id);
+                CREATE INDEX idx_cloudpayments_saved_cards_user_default ON cloudpayments_saved_cards(user_id, is_default);
+                """
+            else:
+                logger.error(f"Неподдерживаемый тип БД для таблицы {table_name}: {db_type}")
+                return False
+            
+            await conn.execute(text(create_sql))
+            logger.info(f"Таблица {table_name} успешно создана")
+            return True
+            
+    except Exception as e:
+        logger.error(f"Ошибка создания таблицы {table_name}: {e}")
+        return False
+
+
 async def ensure_cloudpayments_transaction_id_bigint() -> bool:
     """
     Изменяет тип колонки transaction_id_cp в таблице cloudpayments_payments
@@ -6621,6 +6710,13 @@ async def run_universal_migration():
             logger.info("✅ Колонка transaction_id_cp в cloudpayments_payments имеет тип BIGINT")
         else:
             logger.warning("⚠️ Проблемы с изменением типа колонки transaction_id_cp")
+
+        logger.info("=== СОЗДАНИЕ ТАБЛИЦЫ CLOUDPAYMENTS_SAVED_CARDS ===")
+        saved_cards_ready = await create_cloudpayments_saved_cards_table()
+        if saved_cards_ready:
+            logger.info("✅ Таблица cloudpayments_saved_cards готова")
+        else:
+            logger.warning("⚠️ Проблемы с таблицей cloudpayments_saved_cards")
 
         logger.info("=== ОБНОВЛЕНИЕ ВНЕШНИХ КЛЮЧЕЙ ===")
         fk_updated = await fix_foreign_keys_for_user_deletion()
