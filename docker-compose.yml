@@ -12,6 +12,7 @@ services:
       - postgres_data:/var/lib/postgresql/data
     networks:
       - bot_network
+      - remnawave-network # Подключаем к сети панели
     healthcheck:
       test:
         [
@@ -32,6 +33,7 @@ services:
       - redis_data:/data
     networks:
       - bot_network
+      - remnawave-network # Подключаем к сети панели
     healthcheck:
       test: ['CMD', 'redis-cli', 'ping']
       interval: 30s
@@ -57,28 +59,21 @@ services:
       POSTGRES_DB: '${POSTGRES_DB:-remnawave_bot}'
       POSTGRES_USER: '${POSTGRES_USER:-remnawave_user}'
       POSTGRES_PASSWORD: '${POSTGRES_PASSWORD:-secure_password_123}'
-
       REDIS_URL: 'redis://redis:6379/0'
-
       TZ: 'Europe/Moscow'
       LOCALES_PATH: '${LOCALES_PATH:-/app/locales}'
     volumes:
-      # Логи
       - ./logs:/app/logs:rw
-      # Данные приложения (для SQLite в случае переключения)
       - ./data:/app/data:rw
       - ./locales:/app/locales:rw
-      # Конфигурация приложения
-      # - ./app-config.json:/app/app-config.json:ro
-      # Timezone
       - /etc/timezone:/etc/timezone:ro
       - /etc/localtime:/etc/localtime:ro
-      # Логотип для сообщений
       - ./vpn_logo.png:/app/vpn_logo.png:ro
     ports:
       - '${WEB_API_PORT:-8080}:8080'
     networks:
       - bot_network
+      - remnawave-network # Подключаем к сети панели
     healthcheck:
       test:
         [
@@ -105,3 +100,7 @@ networks:
           gateway: 172.20.0.1
     driver_opts:
       com.docker.network.driver.mtu: 1350
+
+  remnawave-network:
+    name: remnawave-network
+    external: true # Используем существующую сеть панели

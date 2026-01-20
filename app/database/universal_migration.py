@@ -6036,6 +6036,178 @@ async def ensure_cloudpayments_transaction_id_bigint() -> bool:
         return False
 
 
+async def add_tariff_recurrent_columns() -> bool:
+    """Добавляет колонки для рекуррентных платежей в тарифы."""
+    try:
+        columns_added = 0
+        db_type = await get_database_type()
+
+        # is_recurrent_enabled
+        if not await check_column_exists('tariffs', 'is_recurrent_enabled'):
+            async with engine.begin() as conn:
+                if db_type == 'sqlite':
+                    await conn.execute(text(
+                        "ALTER TABLE tariffs ADD COLUMN is_recurrent_enabled INTEGER DEFAULT 0 NOT NULL"
+                    ))
+                elif db_type == 'postgresql':
+                    await conn.execute(text(
+                        "ALTER TABLE tariffs ADD COLUMN is_recurrent_enabled BOOLEAN DEFAULT FALSE NOT NULL"
+                    ))
+                else:  # MySQL
+                    await conn.execute(text(
+                        "ALTER TABLE tariffs ADD COLUMN is_recurrent_enabled TINYINT(1) DEFAULT 0 NOT NULL"
+                    ))
+                logger.info("✅ Колонка is_recurrent_enabled добавлена в tariffs")
+                columns_added += 1
+        else:
+            logger.info("ℹ️ Колонка is_recurrent_enabled уже существует в tariffs")
+
+        # trial_period_days
+        if not await check_column_exists('tariffs', 'trial_period_days'):
+            async with engine.begin() as conn:
+                await conn.execute(text(
+                    "ALTER TABLE tariffs ADD COLUMN trial_period_days INTEGER NULL"
+                ))
+                logger.info("✅ Колонка trial_period_days добавлена в tariffs")
+                columns_added += 1
+        else:
+            logger.info("ℹ️ Колонка trial_period_days уже существует в tariffs")
+
+        # trial_price_kopeks
+        if not await check_column_exists('tariffs', 'trial_price_kopeks'):
+            async with engine.begin() as conn:
+                await conn.execute(text(
+                    "ALTER TABLE tariffs ADD COLUMN trial_price_kopeks INTEGER NULL"
+                ))
+                logger.info("✅ Колонка trial_price_kopeks добавлена в tariffs")
+                columns_added += 1
+        else:
+            logger.info("ℹ️ Колонка trial_price_kopeks уже существует в tariffs")
+
+        if columns_added == 0:
+            logger.info("ℹ️ Все колонки рекуррентных платежей уже существуют в tariffs")
+        else:
+            logger.info(f"✅ Добавлено {columns_added} колонок рекуррентных платежей в tariffs")
+
+        return True
+
+    except Exception as error:
+        logger.error(f"❌ Ошибка добавления колонок рекуррентных платежей: {error}")
+        return False
+
+
+async def create_recurring_subscriptions_table() -> bool:
+    """Создаёт таблицу рекуррентных подписок CloudPayments."""
+    try:
+        if await check_table_exists('recurring_subscriptions'):
+            logger.info("ℹ️ Таблица recurring_subscriptions уже существует")
+            return True
+
+        async with engine.begin() as conn:
+            db_type = await get_database_type()
+
+            if db_type == 'sqlite':
+                await conn.execute(text("""
+                CREATE TABLE recurring_subscriptions (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    subscription_id INTEGER NOT NULL UNIQUE,
+                    cloudpayments_subscription_id VARCHAR(255) UNIQUE,
+                    cloudpayments_token VARCHAR(255) NOT NULL,
+                    tariff_id INTEGER,
+                    period_days INTEGER NOT NULL,
+                    amount_kopeks INTEGER NOT NULL,
+                    trial_period_days INTEGER NOT NULL,
+                    trial_amount_kopeks INTEGER NOT NULL,
+                    trial_start_date DATETIME NOT NULL,
+                    trial_end_date DATETIME NOT NULL,
+                    is_active BOOLEAN DEFAULT 1 NOT NULL,
+                    next_payment_date DATETIME,
+                    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                    FOREIGN KEY (subscription_id) REFERENCES subscriptions(id) ON DELETE CASCADE,
+                    FOREIGN KEY (tariff_id) REFERENCES tariffs(id) ON DELETE SET NULL
+                )
+                """))
+                await conn.execute(text(
+                    "CREATE INDEX IF NOT EXISTS idx_recurring_subscriptions_subscription_id ON recurring_subscriptions(subscription_id)"
+                ))
+                await conn.execute(text(
+                    "CREATE INDEX IF NOT EXISTS idx_recurring_subscriptions_cp_subscription_id ON recurring_subscriptions(cloudpayments_subscription_id)"
+                ))
+                await conn.execute(text(
+                    "CREATE INDEX IF NOT EXISTS idx_recurring_subscriptions_tariff_id ON recurring_subscriptions(tariff_id)"
+                ))
+            elif db_type == 'postgresql':
+                await conn.execute(text("""
+                CREATE TABLE recurring_subscriptions (
+                    id SERIAL PRIMARY KEY,
+                    subscription_id INTEGER NOT NULL UNIQUE,
+                    cloudpayments_subscription_id VARCHAR(255) UNIQUE,
+                    cloudpayments_token VARCHAR(255) NOT NULL,
+                    tariff_id INTEGER,
+                    period_days INTEGER NOT NULL,
+                    amount_kopeks INTEGER NOT NULL,
+                    trial_period_days INTEGER NOT NULL,
+                    trial_amount_kopeks INTEGER NOT NULL,
+                    trial_start_date TIMESTAMP NOT NULL,
+                    trial_end_date TIMESTAMP NOT NULL,
+                    is_active BOOLEAN DEFAULT TRUE NOT NULL,
+                    next_payment_date TIMESTAMP,
+                    created_at TIMESTAMP DEFAULT NOW(),
+                    updated_at TIMESTAMP DEFAULT NOW(),
+                    FOREIGN KEY (subscription_id) REFERENCES subscriptions(id) ON DELETE CASCADE,
+                    FOREIGN KEY (tariff_id) REFERENCES tariffs(id) ON DELETE SET NULL
+                )
+                """))
+                await conn.execute(text(
+                    "CREATE INDEX IF NOT EXISTS idx_recurring_subscriptions_subscription_id ON recurring_subscriptions(subscription_id)"
+                ))
+                await conn.execute(text(
+                    "CREATE INDEX IF NOT EXISTS idx_recurring_subscriptions_cp_subscription_id ON recurring_subscriptions(cloudpayments_subscription_id)"
+                ))
+                await conn.execute(text(
+                    "CREATE INDEX IF NOT EXISTS idx_recurring_subscriptions_tariff_id ON recurring_subscriptions(tariff_id)"
+                ))
+            else:  # MySQL
+                await conn.execute(text("""
+                CREATE TABLE recurring_subscriptions (
+                    id INT AUTO_INCREMENT PRIMARY KEY,
+                    subscription_id INT NOT NULL UNIQUE,
+                    cloudpayments_subscription_id VARCHAR(255) UNIQUE,
+                    cloudpayments_token VARCHAR(255) NOT NULL,
+                    tariff_id INT,
+                    period_days INT NOT NULL,
+                    amount_kopeks INT NOT NULL,
+                    trial_period_days INT NOT NULL,
+                    trial_amount_kopeks INT NOT NULL,
+                    trial_start_date DATETIME NOT NULL,
+                    trial_end_date DATETIME NOT NULL,
+                    is_active TINYINT(1) DEFAULT 1 NOT NULL,
+                    next_payment_date DATETIME,
+                    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+                    FOREIGN KEY (subscription_id) REFERENCES subscriptions(id) ON DELETE CASCADE,
+                    FOREIGN KEY (tariff_id) REFERENCES tariffs(id) ON DELETE SET NULL
+                )
+                """))
+                await conn.execute(text(
+                    "CREATE INDEX idx_recurring_subscriptions_subscription_id ON recurring_subscriptions(subscription_id)"
+                ))
+                await conn.execute(text(
+                    "CREATE INDEX idx_recurring_subscriptions_cp_subscription_id ON recurring_subscriptions(cloudpayments_subscription_id)"
+                ))
+                await conn.execute(text(
+                    "CREATE INDEX idx_recurring_subscriptions_tariff_id ON recurring_subscriptions(tariff_id)"
+                ))
+
+        logger.info("✅ Таблица recurring_subscriptions создана")
+        return True
+
+    except Exception as error:
+        logger.error(f"❌ Ошибка создания таблицы recurring_subscriptions: {error}")
+        return False
+
+
 async def add_subscription_traffic_reset_at_column() -> bool:
     """Добавляет колонку traffic_reset_at в subscriptions для сброса докупленного трафика через 30 дней."""
     try:
@@ -6600,6 +6772,20 @@ async def run_universal_migration():
             logger.info("✅ Колонки произвольных дней/трафика в tariffs готовы")
         else:
             logger.warning("⚠️ Проблемы с колонками произвольных дней/трафика в tariffs")
+
+        logger.info("=== ДОБАВЛЕНИЕ КОЛОНОК РЕКУРРЕНТНЫХ ПЛАТЕЖЕЙ ===")
+        recurrent_columns_ready = await add_tariff_recurrent_columns()
+        if recurrent_columns_ready:
+            logger.info("✅ Колонки рекуррентных платежей в tariffs готовы")
+        else:
+            logger.warning("⚠️ Проблемы с колонками рекуррентных платежей в tariffs")
+
+        logger.info("=== СОЗДАНИЕ ТАБЛИЦЫ RECURRING_SUBSCRIPTIONS ===")
+        recurring_subscriptions_ready = await create_recurring_subscriptions_table()
+        if recurring_subscriptions_ready:
+            logger.info("✅ Таблица recurring_subscriptions готова")
+        else:
+            logger.warning("⚠️ Проблемы с таблицей recurring_subscriptions")
 
         logger.info("=== ДОБАВЛЕНИЕ КОЛОНОК СУТОЧНЫХ ПОДПИСОК ===")
         daily_subscription_columns_ready = await add_subscription_daily_columns()

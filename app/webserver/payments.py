@@ -776,23 +776,35 @@ def create_payment_router(bot: Bot, payment_service: PaymentService) -> APIRoute
                 logger.error("CloudPayments webhook parse error: %s", error)
                 return JSONResponse({"code": 0})
 
-            # Определяем тип webhook по статусу
-            status_value = webhook_data.get("status", "")
+            # Проверяем тип webhook
+            # Recurrent webhook для рекуррентных платежей имеет SubscriptionId
+            subscription_id = webhook_data.get("subscription_id")
+            
+            if subscription_id:
+                # Это webhook Recurrent для рекуррентных платежей
+                await _process_payment_service_callback(
+                    payment_service,
+                    webhook_data,
+                    "process_cloudpayments_recurrent_webhook",
+                )
+            else:
+                # Обычные webhooks (Pay/Fail)
+                status_value = webhook_data.get("status", "")
 
-            if status_value in ("Completed", "Authorized"):
-                # Успешная оплата
-                await _process_payment_service_callback(
-                    payment_service,
-                    webhook_data,
-                    "process_cloudpayments_pay_webhook",
-                )
-            elif status_value in ("Declined", "Cancelled"):
-                # Неуспешная оплата
-                await _process_payment_service_callback(
-                    payment_service,
-                    webhook_data,
-                    "process_cloudpayments_fail_webhook",
-                )
+                if status_value in ("Completed", "Authorized"):
+                    # Успешная оплата
+                    await _process_payment_service_callback(
+                        payment_service,
+                        webhook_data,
+                        "process_cloudpayments_pay_webhook",
+                    )
+                elif status_value in ("Declined", "Cancelled"):
+                    # Неуспешная оплата
+                    await _process_payment_service_callback(
+                        payment_service,
+                        webhook_data,
+                        "process_cloudpayments_fail_webhook",
+                    )
 
             return JSONResponse({"code": 0})
 

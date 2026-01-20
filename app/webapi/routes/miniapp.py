@@ -6621,6 +6621,77 @@ async def purchase_tariff_endpoint(
         if discount_percent > 0:
             price_kopeks = int(base_price_kopeks * (100 - discount_percent) / 100)
 
+    # Проверяем, включены ли рекуррентные платежи
+    if tariff.is_recurrent_enabled:
+        # Recurring payment flow
+        if not tariff.trial_price_kopeks or tariff.trial_price_kopeks <= 0:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail={
+                    "code": "trial_price_not_configured",
+                    "message": "Trial price not configured for this tariff",
+                },
+            )
+        if not tariff.trial_period_days or tariff.trial_period_days <= 0:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail={
+                    "code": "trial_period_not_configured",
+                    "message": "Trial period not configured for this tariff",
+                },
+            )
+
+        # Generate CloudPayments payment link for trial
+        from app.services.payment_service import PaymentService
+        from app.services.cloudpayments_service import CloudPaymentsService
+
+        payment_service = PaymentService(bot=None)
+        cloudpayments_service = CloudPaymentsService()
+        payment_service.cloudpayments_service = cloudpayments_service
+
+        # Use trial price for first payment
+        trial_price_kopeks = tariff.trial_price_kopeks
+        description = f"Trial подписка на тариф '{tariff.name}' ({tariff.trial_period_days} дней)"
+
+        # Add metadata for recurring tariff
+        metadata = {
+            "is_recurring_tariff": True,
+            "tariff_id": tariff.id,
+            "period_days": payload.period_days,
+            "trial_period_days": tariff.trial_period_days,
+        }
+
+        payment_result = await payment_service.create_cloudpayments_payment(
+            db=db,
+            user_id=user.id,
+            amount_kopeks=trial_price_kopeks,
+            description=description,
+            telegram_id=user.telegram_id,
+            language=user.language,
+            email=user.email,
+            metadata=metadata,
+        )
+
+        if not payment_result:
+            raise HTTPException(
+                status_code=status.HTTP_502_BAD_GATEWAY,
+                detail={
+                    "code": "payment_creation_failed",
+                    "message": "Failed to create payment link",
+                },
+            )
+
+        return {
+            "success": True,
+            "payment_url": payment_result["payment_url"],
+            "payment_id": payment_result["payment_id"],
+            "invoice_id": payment_result["invoice_id"],
+            "is_recurring": True,
+            "trial_price_kopeks": trial_price_kopeks,
+            "trial_period_days": tariff.trial_period_days,
+        }
+
+    # Regular payment flow (balance-based)
     # Проверяем баланс
     if user.balance_kopeks < price_kopeks:
         missing = price_kopeks - user.balance_kopeks

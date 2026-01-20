@@ -328,4 +328,205 @@ class CloudPaymentsService:
             "reason_code": int(form_data.get("ReasonCode", 0)) if form_data.get("ReasonCode") else None,
             "card_holder_message": form_data.get("CardHolderMessage"),
             "data": form_data.get("Data"),  # JSON string with custom data
+            "subscription_id": form_data.get("SubscriptionId"),  # ID подписки для рекуррентных платежей
         }
+
+    async def create_subscription(
+        self,
+        token: str,
+        account_id: str,
+        amount_kopeks: int,
+        start_date: str,  # Format: "YYYY-MM-DDTHH:mm:ss" (ISO 8601)
+        interval: str,  # "Day", "Week", "Month"
+        period: int,  # Period of interval (e.g., 30 for every 30 days)
+        description: Optional[str] = None,
+        email: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """
+        Create a recurring subscription via CloudPayments API.
+
+        Args:
+            token: Card token from first payment
+            account_id: User's account ID (telegram_id)
+            amount_kopeks: Recurring payment amount in kopeks
+            start_date: Start date for first recurring payment (ISO 8601 format)
+            interval: Interval type ("Day", "Week", "Month")
+            period: Period of interval (e.g., 30 for every 30 days)
+            description: Subscription description
+            email: User's email (optional)
+
+        Returns:
+            CloudPayments API response with subscription ID
+
+        Reference: https://developers.cloudpayments.ru/#sozdanie-podpiski-na-rekurrentnye-platezhi
+        """
+        if not self.is_configured:
+            raise CloudPaymentsAPIError("CloudPayments is not configured")
+
+        amount = self._amount_from_kopeks(amount_kopeks)
+
+        payload: Dict[str, Any] = {
+            "Token": token,
+            "AccountId": account_id,
+            "Description": description or settings.CLOUDPAYMENTS_DESCRIPTION,
+            "Amount": amount,
+            "Currency": settings.CLOUDPAYMENTS_CURRENCY,
+            "RequireConfirmation": False,  # Автоматические списания без подтверждения
+            "StartDate": start_date,
+            "Interval": interval,
+            "Period": period,
+        }
+
+        if email:
+            payload["Email"] = email
+
+        response = await self._request("POST", "/subscriptions/create", json=payload)
+
+        if not response.get("Success"):
+            error_message = response.get("Message", "Unknown error")
+            logger.error("CloudPayments subscriptions/create failed: %s", error_message)
+            raise CloudPaymentsAPIError(f"Failed to create subscription: {error_message}")
+
+        model = response.get("Model", {})
+        subscription_id = model.get("Id")
+
+        if not subscription_id:
+            logger.error("CloudPayments subscriptions/create returned no subscription ID: %s", response)
+            raise CloudPaymentsAPIError("CloudPayments API returned no subscription ID")
+
+        logger.info(
+            "CloudPayments subscription created: id=%s, amount=%s₽, interval=%s, period=%s",
+            subscription_id,
+            amount,
+            interval,
+            period,
+        )
+
+        return {
+            "subscription_id": str(subscription_id),
+            "model": model,
+        }
+
+    async def get_subscription(self, subscription_id: str) -> Dict[str, Any]:
+        """
+        Get subscription information via CloudPayments API.
+
+        Args:
+            subscription_id: CloudPayments subscription ID
+
+        Returns:
+            CloudPayments API response with subscription details
+        """
+        if not self.is_configured:
+            raise CloudPaymentsAPIError("CloudPayments is not configured")
+
+        response = await self._request(
+            "POST",
+            "/subscriptions/get",
+            json={"Id": subscription_id},
+        )
+
+        if not response.get("Success"):
+            error_message = response.get("Message", "Unknown error")
+            logger.error("CloudPayments subscriptions/get failed: %s", error_message)
+            raise CloudPaymentsAPIError(f"Failed to get subscription: {error_message}")
+
+        return response.get("Model", {})
+
+    async def update_subscription(
+        self,
+        subscription_id: str,
+        amount_kopeks: Optional[int] = None,
+        interval: Optional[str] = None,
+        period: Optional[int] = None,
+        description: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """
+        Update subscription via CloudPayments API.
+
+        Args:
+            subscription_id: CloudPayments subscription ID
+            amount_kopeks: New payment amount in kopeks (optional)
+            interval: New interval type (optional)
+            period: New period (optional)
+            description: New description (optional)
+
+        Returns:
+            CloudPayments API response
+        """
+        if not self.is_configured:
+            raise CloudPaymentsAPIError("CloudPayments is not configured")
+
+        payload: Dict[str, Any] = {"Id": subscription_id}
+
+        if amount_kopeks is not None:
+            payload["Amount"] = self._amount_from_kopeks(amount_kopeks)
+        if interval is not None:
+            payload["Interval"] = interval
+        if period is not None:
+            payload["Period"] = period
+        if description is not None:
+            payload["Description"] = description
+
+        response = await self._request("POST", "/subscriptions/update", json=payload)
+
+        if not response.get("Success"):
+            error_message = response.get("Message", "Unknown error")
+            logger.error("CloudPayments subscriptions/update failed: %s", error_message)
+            raise CloudPaymentsAPIError(f"Failed to update subscription: {error_message}")
+
+        return response.get("Model", {})
+
+    async def cancel_subscription(self, subscription_id: str) -> Dict[str, Any]:
+        """
+        Cancel subscription via CloudPayments API.
+
+        Args:
+            subscription_id: CloudPayments subscription ID
+
+        Returns:
+            CloudPayments API response
+        """
+        if not self.is_configured:
+            raise CloudPaymentsAPIError("CloudPayments is not configured")
+
+        response = await self._request(
+            "POST",
+            "/subscriptions/cancel",
+            json={"Id": subscription_id},
+        )
+
+        if not response.get("Success"):
+            error_message = response.get("Message", "Unknown error")
+            logger.error("CloudPayments subscriptions/cancel failed: %s", error_message)
+            raise CloudPaymentsAPIError(f"Failed to cancel subscription: {error_message}")
+
+        logger.info("CloudPayments subscription cancelled: id=%s", subscription_id)
+
+        return response.get("Model", {})
+
+    async def find_subscriptions(self, account_id: str) -> List[Dict[str, Any]]:
+        """
+        Find subscriptions by AccountId via CloudPayments API.
+
+        Args:
+            account_id: User's account ID (telegram_id)
+
+        Returns:
+            List of subscription dictionaries
+        """
+        if not self.is_configured:
+            raise CloudPaymentsAPIError("CloudPayments is not configured")
+
+        response = await self._request(
+            "POST",
+            "/subscriptions/find",
+            json={"AccountId": account_id},
+        )
+
+        if not response.get("Success"):
+            error_message = response.get("Message", "Unknown error")
+            logger.error("CloudPayments subscriptions/find failed: %s", error_message)
+            raise CloudPaymentsAPIError(f"Failed to find subscriptions: {error_message}")
+
+        return response.get("Model", [])

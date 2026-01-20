@@ -805,6 +805,11 @@ class Tariff(Base):
     min_traffic_gb = Column(Integer, default=1, nullable=False)  # Минимальный трафик в ГБ
     max_traffic_gb = Column(Integer, default=1000, nullable=False)  # Максимальный трафик в ГБ
 
+    # Рекуррентные платежи
+    is_recurrent_enabled = Column(Boolean, default=False, nullable=False)  # Включены ли рекуррентные платежи
+    trial_period_days = Column(Integer, nullable=True)  # Период trial подписки в днях
+    trial_price_kopeks = Column(Integer, nullable=True)  # Стоимость trial платежа в копейках
+
     created_at = Column(DateTime, default=func.now())
     updated_at = Column(DateTime, default=func.now(), onupdate=func.now())
 
@@ -1235,6 +1240,42 @@ class Subscription(Base):
         if self.status != SubscriptionStatus.ACTIVE.value:
             return False
         return True
+
+
+class RecurringSubscription(Base):
+    """Рекуррентная подписка CloudPayments для тарифа."""
+    __tablename__ = "recurring_subscriptions"
+
+    id = Column(Integer, primary_key=True, index=True)
+    subscription_id = Column(Integer, ForeignKey("subscriptions.id", ondelete="CASCADE"), nullable=False, unique=True, index=True)
+    
+    # CloudPayments идентификаторы
+    cloudpayments_subscription_id = Column(String(255), unique=True, nullable=True, index=True)  # ID подписки в CloudPayments
+    cloudpayments_token = Column(String(255), nullable=False)  # Токен карты из первого платежа
+    
+    # Информация о тарифе и платеже
+    tariff_id = Column(Integer, ForeignKey("tariffs.id", ondelete="SET NULL"), nullable=True, index=True)
+    period_days = Column(Integer, nullable=False)  # Период рекуррентного списания
+    amount_kopeks = Column(Integer, nullable=False)  # Сумма рекуррентного списания
+    
+    # Информация о trial
+    trial_period_days = Column(Integer, nullable=False)  # Период trial подписки
+    trial_amount_kopeks = Column(Integer, nullable=False)  # Сумма trial платежа
+    trial_start_date = Column(DateTime, nullable=False)  # Даты начала trial
+    trial_end_date = Column(DateTime, nullable=False)  # Дата окончания trial (дата первого рекуррентного платежа)
+    
+    # Статус подписки
+    is_active = Column(Boolean, default=True, nullable=False)  # Активна ли подписка
+    next_payment_date = Column(DateTime, nullable=True)  # Дата следующего списания
+    
+    created_at = Column(DateTime, default=func.now())
+    updated_at = Column(DateTime, default=func.now(), onupdate=func.now())
+
+    subscription = relationship("Subscription", backref="recurring_subscription")
+    tariff = relationship("Tariff")
+
+    def __repr__(self):
+        return f"<RecurringSubscription(id={self.id}, subscription_id={self.subscription_id}, cp_subscription_id={self.cloudpayments_subscription_id}, active={self.is_active})>"
 
 
 class Transaction(Base):

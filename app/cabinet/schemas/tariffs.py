@@ -100,6 +100,10 @@ class TariffDetailResponse(BaseModel):
     # Дневной тариф
     is_daily: bool = False
     daily_price_kopeks: int = 0
+    # Рекуррентные платежи
+    is_recurrent_enabled: bool = False
+    trial_period_days: Optional[int] = Field(None, ge=1)
+    trial_price_kopeks: Optional[int] = Field(None, ge=0)
     created_at: datetime
     updated_at: Optional[datetime] = None
 
@@ -137,6 +141,10 @@ class TariffCreateRequest(BaseModel):
     # Дневной тариф
     is_daily: bool = False
     daily_price_kopeks: int = Field(0, ge=0)
+    # Рекуррентные платежи
+    is_recurrent_enabled: bool = False
+    trial_period_days: Optional[int] = Field(None, ge=1)
+    trial_price_kopeks: Optional[int] = Field(None, ge=0)
 
 
 class TariffUpdateRequest(BaseModel):
@@ -170,6 +178,10 @@ class TariffUpdateRequest(BaseModel):
     # Дневной тариф
     is_daily: Optional[bool] = None
     daily_price_kopeks: Optional[int] = Field(None, ge=0)
+    # Рекуррентные платежи
+    is_recurrent_enabled: Optional[bool] = None
+    trial_period_days: Optional[int] = Field(None, ge=1)
+    trial_price_kopeks: Optional[int] = Field(None, ge=0)
 
 
 class TariffToggleResponse(BaseModel):

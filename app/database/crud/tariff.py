@@ -185,6 +185,10 @@ async def create_tariff(
     traffic_price_per_gb_kopeks: int = 0,
     min_traffic_gb: int = 1,
     max_traffic_gb: int = 1000,
+    # Рекуррентные платежи
+    is_recurrent_enabled: bool = False,
+    trial_period_days: Optional[int] = None,
+    trial_price_kopeks: Optional[int] = None,
 ) -> Tariff:
     """Создает новый тариф."""
     normalized_prices = _normalize_period_prices(period_prices)
@@ -218,6 +222,10 @@ async def create_tariff(
         traffic_price_per_gb_kopeks=max(0, traffic_price_per_gb_kopeks),
         min_traffic_gb=max(1, min_traffic_gb),
         max_traffic_gb=max(1, max_traffic_gb),
+        # Рекуррентные платежи
+        is_recurrent_enabled=is_recurrent_enabled,
+        trial_period_days=trial_period_days,
+        trial_price_kopeks=trial_price_kopeks,
     )
 
     db.add(tariff)
@@ -280,6 +288,10 @@ async def update_tariff(
     traffic_price_per_gb_kopeks: Optional[int] = None,
     min_traffic_gb: Optional[int] = None,
     max_traffic_gb: Optional[int] = None,
+    # Рекуррентные платежи
+    is_recurrent_enabled: Optional[bool] = None,
+    trial_period_days: Optional[int] = None,
+    trial_price_kopeks: Optional[int] = None,
 ) -> Tariff:
     """Обновляет существующий тариф."""
     if name is not None:
@@ -337,6 +349,13 @@ async def update_tariff(
         tariff.min_traffic_gb = max(1, min_traffic_gb)
     if max_traffic_gb is not None:
         tariff.max_traffic_gb = max(1, max_traffic_gb)
+    # Рекуррентные платежи
+    if is_recurrent_enabled is not None:
+        tariff.is_recurrent_enabled = is_recurrent_enabled
+    if trial_period_days is not None:
+        tariff.trial_period_days = trial_period_days if trial_period_days > 0 else None
+    if trial_price_kopeks is not None:
+        tariff.trial_price_kopeks = trial_price_kopeks if trial_price_kopeks > 0 else None
 
     # Обновляем промогруппы если указаны
     if promo_group_ids is not None:

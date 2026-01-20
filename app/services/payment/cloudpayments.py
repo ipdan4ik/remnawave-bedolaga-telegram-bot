@@ -33,6 +33,7 @@ class CloudPaymentsPaymentMixin:
         telegram_id: int,
         language: Optional[str] = None,
         email: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
     ) -> Optional[Dict[str, Any]]:
         """
         Create a CloudPayments payment and return payment link info.
@@ -90,10 +91,14 @@ class CloudPaymentsPaymentMixin:
             logger.exception("Непредвиденная ошибка при создании CloudPayments платежа: %s", error)
             return None
 
-        metadata = {
+        base_metadata = {
             "language": language or settings.DEFAULT_LANGUAGE,
             "telegram_id": telegram_id,
         }
+        # Merge with additional metadata if provided
+        if metadata:
+            base_metadata.update(metadata)
+        metadata = base_metadata
 
         # Create local payment record
         local_payment = await payment_module.create_cloudpayments_payment(
@@ -221,7 +226,30 @@ class CloudPaymentsPaymentMixin:
             logger.error("Пользователь не найден: id=%s", payment.user_id)
             return False
 
-        # Add balance
+        # Check if this is a recurring tariff payment
+        metadata = payment.metadata_json or {}
+        is_recurring_tariff = metadata.get("is_recurring_tariff", False)
+        tariff_id = metadata.get("tariff_id")
+        period_days = metadata.get("period_days")
+        trial_period_days = metadata.get("trial_period_days")
+
+        if is_recurring_tariff and tariff_id and token and period_days and trial_period_days:
+            # This is a recurring tariff payment - handle it differently
+            return await self._process_recurring_tariff_payment(
+                db=db,
+                payment=payment,
+                user=user,
+                webhook_data=webhook_data,
+                token=token,
+                tariff_id=tariff_id,
+                period_days=period_days,
+                trial_period_days=trial_period_days,
+                amount_kopeks=amount_kopeks,
+                transaction_id_cp=transaction_id_cp,
+                invoice_id=invoice_id,
+            )
+
+        # Regular payment - add balance
         await add_user_balance(db, user, amount_kopeks)
 
         # Create transaction record
@@ -477,3 +505,232 @@ class CloudPaymentsPaymentMixin:
                 error,
             )
             return {"payment": payment, "status": payment.status}
+
+    async def _process_recurring_tariff_payment(
+        self,
+        db: AsyncSession,
+        payment: Any,
+        user: Any,
+        webhook_data: Dict[str, Any],
+        token: str,
+        tariff_id: int,
+        period_days: int,
+        trial_period_days: int,
+        amount_kopeks: int,
+        transaction_id_cp: Optional[int],
+        invoice_id: str,
+    ) -> bool:
+        """
+        Process first payment for recurring tariff subscription.
+
+        Args:
+            db: Database session
+            payment: CloudPaymentsPayment object
+            user: User object
+            webhook_data: Webhook data
+            token: Card token from payment
+            tariff_id: Tariff ID
+            period_days: Recurring period in days
+            trial_period_days: Trial period in days
+            amount_kopeks: Trial payment amount
+            transaction_id_cp: CloudPayments transaction ID
+            invoice_id: Invoice ID
+
+        Returns:
+            True if processed successfully
+        """
+        from datetime import timedelta
+        from app.database.crud.tariff import get_tariff_by_id
+        from app.database.crud.recurring_subscription import create_recurring_subscription
+        from app.database.crud.subscription import (
+            get_subscription_by_user_id,
+            create_paid_subscription,
+            extend_subscription,
+        )
+        from app.database.crud.transaction import create_transaction
+        from app.database.crud.server_squad import get_all_server_squads
+
+        try:
+            # Get tariff
+            tariff = await get_tariff_by_id(db, tariff_id)
+            if not tariff:
+                logger.error("Тариф не найден: id=%s", tariff_id)
+                return False
+
+            if not tariff.is_recurrent_enabled:
+                logger.error("Тариф не поддерживает рекуррентные платежи: id=%s", tariff_id)
+                return False
+
+            # Calculate trial dates
+            trial_start_date = datetime.utcnow()
+            trial_end_date = trial_start_date + timedelta(days=trial_period_days)
+
+            # Get recurring payment amount (from tariff period_prices)
+            recurring_amount_kopeks = tariff.get_price_for_period(period_days)
+            if not recurring_amount_kopeks:
+                logger.error("Не найдена цена для периода %s дней в тарифе %s", period_days, tariff_id)
+                return False
+
+            # Get subscription or create new one
+            subscription = await get_subscription_by_user_id(db, user.id)
+
+            if not subscription:
+                # Get squads for tariff
+                squads = tariff.allowed_squads or []
+                if not squads:
+                    all_servers, _ = await get_all_server_squads(db, available_only=True)
+                    squads = [s.squad_uuid for s in all_servers if s.squad_uuid]
+
+                # Create trial subscription
+                subscription = await create_paid_subscription(
+                    db=db,
+                    user_id=user.id,
+                    duration_days=trial_period_days,
+                    traffic_limit_gb=tariff.traffic_limit_gb,
+                    device_limit=tariff.device_limit,
+                    connected_squads=squads,
+                    tariff_id=tariff.id,
+                )
+            else:
+                # Extend existing subscription with trial period
+                subscription = await extend_subscription(
+                    db=db,
+                    subscription=subscription,
+                    days=trial_period_days,
+                    tariff_id=tariff.id,
+                    traffic_limit_gb=tariff.traffic_limit_gb,
+                    device_limit=tariff.device_limit,
+                    connected_squads=tariff.allowed_squads or [],
+                )
+
+            # Create CloudPayments subscription
+            # Format start date for CloudPayments (ISO 8601)
+            start_date_str = trial_end_date.strftime("%Y-%m-%dT%H:%M:%S")
+
+            # Determine interval and period for CloudPayments API
+            # For periods <= 31 days, use "Day" interval
+            # For periods > 31 days, convert to months
+            if period_days <= 31:
+                interval = "Day"
+                period = period_days
+            else:
+                # Approximate months (30 days per month)
+                interval = "Month"
+                period = max(1, period_days // 30)
+
+            if not getattr(self, "cloudpayments_service", None):
+                logger.error("CloudPayments service не инициализирован")
+                return False
+
+            try:
+                subscription_response = await self.cloudpayments_service.create_subscription(
+                    token=token,
+                    account_id=str(user.telegram_id),
+                    amount_kopeks=recurring_amount_kopeks,
+                    start_date=start_date_str,
+                    interval=interval,
+                    period=period,
+                    description=f"Подписка на тариф '{tariff.name}' ({period_days} дней)",
+                    email=user.email,
+                )
+                cp_subscription_id = subscription_response.get("subscription_id")
+            except CloudPaymentsAPIError as error:
+                logger.error("Ошибка создания подписки CloudPayments: %s", error)
+                # Rollback subscription creation?
+                return False
+
+            # Calculate next payment date (first recurring payment date)
+            next_payment_date = trial_end_date
+
+            # Create RecurringSubscription record
+            recurring_sub = await create_recurring_subscription(
+                db=db,
+                subscription_id=subscription.id,
+                cloudpayments_token=token,
+                tariff_id=tariff.id,
+                period_days=period_days,
+                amount_kopeks=recurring_amount_kopeks,
+                trial_period_days=trial_period_days,
+                trial_amount_kopeks=amount_kopeks,
+                trial_start_date=trial_start_date,
+                trial_end_date=trial_end_date,
+                cloudpayments_subscription_id=cp_subscription_id,
+                next_payment_date=next_payment_date,
+                is_active=True,
+            )
+
+            # Create transaction record (SUBSCRIPTION_PAYMENT, no balance top-up)
+            transaction = await create_transaction(
+                db=db,
+                user_id=user.id,
+                type=TransactionType.SUBSCRIPTION_PAYMENT,
+                amount_kopeks=amount_kopeks,
+                description=f"Trial подписка на тариф '{tariff.name}' ({trial_period_days} дней) - рекуррентный платёж",
+                payment_method=PaymentMethod.CLOUDPAYMENTS,
+                external_id=str(transaction_id_cp) if transaction_id_cp else invoice_id,
+                is_completed=True,
+            )
+
+            payment.transaction_id = transaction.id
+            await db.commit()
+
+            logger.info(
+                "Рекуррентный тариф активирован: user=%s, tariff=%s, trial=%s дней, subscription_id=%s, cp_subscription_id=%s",
+                user.telegram_id,
+                tariff_id,
+                trial_period_days,
+                subscription.id,
+                cp_subscription_id,
+            )
+
+            # Send notification to user
+            try:
+                await self._send_recurring_tariff_activation_notification(
+                    user=user,
+                    tariff=tariff,
+                    trial_period_days=trial_period_days,
+                    trial_amount_kopeks=amount_kopeks,
+                )
+            except Exception as error:
+                logger.exception("Ошибка отправки уведомления о рекуррентной подписке: %s", error)
+
+            return True
+
+        except Exception as error:
+            logger.exception("Ошибка обработки рекуррентного тарифа: %s", error)
+            await db.rollback()
+            return False
+
+    async def _send_recurring_tariff_activation_notification(
+        self,
+        user: Any,
+        tariff: Any,
+        trial_period_days: int,
+        trial_amount_kopeks: int,
+    ) -> None:
+        """Send notification about recurring tariff activation."""
+        bot = getattr(self, "bot", None)
+        from app.localization.texts import get_texts
+
+        if not bot:
+            return
+
+        texts = get_texts(user.language)
+        amount_rub = trial_amount_kopeks / 100
+
+        message = (
+            f"✅ <b>Подписка активирована!</b>\n\n"
+            f"📋 Тариф: {tariff.name}\n"
+            f"💰 Trial период: {trial_period_days} дней за {amount_rub:.2f}₽\n"
+            f"🔄 После окончания trial подписка будет продлеваться автоматически\n\n"
+            f"Спасибо за подписку!"
+        )
+
+        try:
+            await bot.send_message(
+                chat_id=user.telegram_id,
+                text=message,
+                parse_mode="HTML",
+            )
+        except Exception as error:
+            logger.warning("Не удалось отправить уведомление пользователю %s: %s", user.telegram_id, error)

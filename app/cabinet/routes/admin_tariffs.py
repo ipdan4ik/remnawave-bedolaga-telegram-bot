@@ -264,6 +264,10 @@ async def create_new_tariff(
         # Дневной тариф
         is_daily=request.is_daily,
         daily_price_kopeks=request.daily_price_kopeks,
+        # Рекуррентные платежи
+        is_recurrent_enabled=request.is_recurrent_enabled,
+        trial_period_days=request.trial_period_days,
+        trial_price_kopeks=request.trial_price_kopeks,
     )
 
     logger.info(f"Admin {admin.id} created tariff {tariff.id}: {tariff.name}")
@@ -348,6 +352,13 @@ async def update_existing_tariff(
         updates["is_daily"] = request.is_daily
     if request.daily_price_kopeks is not None:
         updates["daily_price_kopeks"] = request.daily_price_kopeks
+    # Рекуррентные платежи
+    if request.is_recurrent_enabled is not None:
+        updates["is_recurrent_enabled"] = request.is_recurrent_enabled
+    if request.trial_period_days is not None:
+        updates["trial_period_days"] = request.trial_period_days
+    if request.trial_price_kopeks is not None:
+        updates["trial_price_kopeks"] = request.trial_price_kopeks
 
     if updates:
         await update_tariff(db, tariff, **updates)

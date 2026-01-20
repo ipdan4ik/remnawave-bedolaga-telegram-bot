@@ -1134,13 +1134,87 @@ async def confirm_tariff_purchase(
     base_price = prices.get(str(period), 0)
     final_price = _apply_promo_discount(base_price, discount_percent)
 
+    texts = get_texts(db_user.language)
+
+    # Проверяем, включены ли рекуррентные платежи
+    if tariff.is_recurrent_enabled:
+        # Recurring payment flow
+        if not tariff.trial_price_kopeks or tariff.trial_price_kopeks <= 0:
+            await callback.answer("Trial цена не настроена для этого тарифа", show_alert=True)
+            return
+        if not tariff.trial_period_days or tariff.trial_period_days <= 0:
+            await callback.answer("Trial период не настроен для этого тарифа", show_alert=True)
+            return
+
+        try:
+            # Generate CloudPayments payment link for trial
+            from app.services.payment_service import PaymentService
+            from app.services.cloudpayments_service import CloudPaymentsService
+
+            payment_service = PaymentService(bot=callback.bot)
+            cloudpayments_service = CloudPaymentsService()
+            payment_service.cloudpayments_service = cloudpayments_service
+
+            # Use trial price for first payment
+            trial_price_kopeks = tariff.trial_price_kopeks
+            description = f"Trial подписка на тариф '{tariff.name}' ({tariff.trial_period_days} дней)"
+
+            # Add metadata for recurring tariff
+            metadata = {
+                "is_recurring_tariff": True,
+                "tariff_id": tariff.id,
+                "period_days": period,
+                "trial_period_days": tariff.trial_period_days,
+            }
+
+            payment_result = await payment_service.create_cloudpayments_payment(
+                db=db,
+                user_id=db_user.id,
+                amount_kopeks=trial_price_kopeks,
+                description=description,
+                telegram_id=db_user.telegram_id,
+                language=db_user.language,
+                email=db_user.email,
+                metadata=metadata,
+            )
+
+            if not payment_result:
+                await callback.answer("Ошибка создания ссылки на оплату", show_alert=True)
+                return
+
+            await state.clear()
+
+            # Send payment URL to user
+            await callback.message.edit_text(
+                f"💳 <b>Оплата trial подписки</b>\n\n"
+                f"📦 Тариф: <b>{tariff.name}</b>\n"
+                f"⏱ Trial период: {tariff.trial_period_days} дней\n"
+                f"💰 Сумма: {trial_price_kopeks / 100:.2f}₽\n"
+                f"🔄 После trial подписка будет продлеваться автоматически\n\n"
+                f"Перейдите по ссылке для оплаты:",
+                parse_mode="HTML",
+                reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                    [InlineKeyboardButton(
+                        text="💳 Оплатить",
+                        url=payment_result["payment_url"]
+                    )]
+                ])
+            )
+            await callback.answer()
+
+            return
+
+        except Exception as e:
+            logger.error(f"Ошибка создания рекуррентного платежа: {e}")
+            await callback.answer("Ошибка создания ссылки на оплату", show_alert=True)
+            return
+
+    # Regular payment flow (balance-based)
     # Проверяем баланс
     user_balance = db_user.balance_kopeks or 0
     if user_balance < final_price:
         await callback.answer("Недостаточно средств на балансе", show_alert=True)
         return
-
-    texts = get_texts(db_user.language)
 
     try:
         # Списываем баланс
